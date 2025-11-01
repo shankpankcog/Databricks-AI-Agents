@@ -3,6 +3,7 @@ from pyspark.sql import SparkSession
 from pyspark.sql.functions import col
 from pyspark.sql.types import StructType, StructField, StringType, TimestampType
 import hashlib
+import datetime
 
 # Import project assets
 import config
@@ -11,15 +12,13 @@ from logger_config import get_logger
 logger = get_logger(__name__)
 
 def create_optimized_cache_table(spark: SparkSession):
-    """Creates the cache table with an explicit schema and optimized properties."""
-    schema = StructType([
-        StructField("query_hash", StringType(), False),
-        StructField("user_query", StringType(), True),
-        StructField("final_response", StringType(), True),
-        StructField("session_id", StringType(), True),
-        StructField("timestamp", TimestampType(), True)
-    ])
+    """
+    Creates the query cache Delta table with an explicit schema and optimized properties
+    if it does not already exist.
 
+    Args:
+        spark (SparkSession): The active Spark session.
+    """
     table_name = config.QUERY_CACHE_TABLE
     if not spark.catalog.tableExists(table_name):
         logger.info(f"Cache table '{table_name}' not found. Creating it.")
@@ -40,11 +39,28 @@ def create_optimized_cache_table(spark: SparkSession):
         logger.info(f"Cache table '{table_name}' already exists.")
 
 def get_query_hash(query: str) -> str:
-    """Creates a unique hash for a query string."""
+    """
+    Creates a unique and deterministic MD5 hash for a given query string.
+
+    Args:
+        query (str): The user's query.
+
+    Returns:
+        str: The MD5 hash of the query.
+    """
     return hashlib.md5(query.encode()).hexdigest()
 
-def check_cache(spark: SparkSession, query: str):
-    """Checks the cache for a response for a given query."""
+def check_cache(spark: SparkSession, query: str) -> str or None:
+    """
+    Checks if a response for a given query exists in the cache.
+
+    Args:
+        spark (SparkSession): The active Spark session.
+        query (str): The user's query.
+
+    Returns:
+        str or None: The cached response as a JSON string if found, otherwise None.
+    """
     create_optimized_cache_table(spark) # Ensure table exists before checking
 
     query_hash = get_query_hash(query)
@@ -64,7 +80,15 @@ def check_cache(spark: SparkSession, query: str):
     return None
 
 def save_to_cache(spark: SparkSession, query: str, response: str, session_id: str):
-    """Saves a new query and its response to the cache."""
+    """
+    Saves a new query and its response to the cache Delta table using a SQL MERGE command.
+
+    Args:
+        spark (SparkSession): The active Spark session.
+        query (str): The user's query.
+        response (str): The final response (as a JSON string) from the agent system.
+        session_id (str): The session ID for tracking conversational context.
+    """
     create_optimized_cache_table(spark) # Ensure table exists before saving
 
     query_hash = get_query_hash(query)
