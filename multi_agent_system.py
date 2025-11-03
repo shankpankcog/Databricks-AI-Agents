@@ -7,8 +7,10 @@ import hashlib
 import uuid
 from functools import partial
 import json
+import re
+import whisper
 
-from langchain_core.messages import BaseMessage, HumanMessage
+from langchain_core.messages import BaseMessage, HumanMessage, AIMessage
 from langchain_openai import ChatOpenAI
 from langgraph.graph import StateGraph, END
 from langchain_core.prompts import ChatPromptTemplate
@@ -23,7 +25,7 @@ import config
 import prompts
 import cache_manager
 from logger_config import get_logger
-from models import RAGResponse, SQLResponse, MixedResponse, ErrorResponse, BaseResponse
+from models import RAGResponse, SQLResponse, MixedResponse, ErrorResponse, VoiceResponse, BaseResponse
 
 logger = get_logger(__name__)
 
@@ -57,12 +59,18 @@ class AgentState(TypedDict):
     final_response: Union[BaseResponse, str]
     from_cache: bool
 
-# --- LLM Initialization ---
+# --- LLM and VSC Initialization ---
 llm = ChatOpenAI(
     model=config.ENDPOINT_NAME,
     api_key=config.DATABRICKS_TOKEN,
     base_url=f"{config.DATABRICKS_HOST}/serving-endpoints"
 )
+vsc = VectorSearchClient()
+
+# --- Pre-load Models ---
+logger.info("Pre-loading Whisper model...")
+whisper_model = whisper.load_model("base")
+logger.info("Whisper model loaded.")
 
 # --- Agent Definitions ---
 
@@ -122,7 +130,7 @@ def router_agent(state: AgentState) -> dict:
 
 def intent_agent(state: AgentState) -> dict:
     """
-    Determines the user's intent (structured, unstructured, or mixed) using the LLM.
+    Determines the user's intent (structured, unstructured, mixed, or voice) using the LLM.
 
     Args:
         state (AgentState): The current state of the workflow.
@@ -139,7 +147,8 @@ def intent_agent(state: AgentState) -> dict:
     if "structured" in intent: return {"intent": "structured"}
     if "unstructured" in intent: return {"intent": "unstructured"}
     if "mixed" in intent: return {"intent": "mixed"}
-    return {"intent": "unstructured"}
+    if "voice" in intent: return {"intent": "voice"}
+    return {"intent": "unstructured"} # Default fallback
 
 def rag_agent(state: AgentState, vsc: VectorSearchClient) -> dict:
     """
@@ -264,6 +273,70 @@ def mixed_intent_agent(state: AgentState, vsc: VectorSearchClient) -> dict:
 
     return {"error": f"Failed to execute mixed-intent SQL query after correction: {error_message}"}
 
+def voice_summarization_agent(state: AgentState) -> dict:
+    """
+    Transcribes an audio file using Whisper and generates a summary with an LLM.
+
+    Args:
+        state (AgentState): The current state of the workflow.
+
+    Returns:
+        dict: A dictionary containing the final response as a Pydantic model.
+    """
+    logger.info("---VOICE SUMMARIZATION AGENT---")
+    user_query = state['user_query']
+
+    # Use regex to find just the filename, not the full path
+    match = re.search(r"[\s\"']?([^\s\"'/]+\.(mp3|wav|m4a|flac))[\s\"']?", user_query)
+    if not match:
+        return {"error": "Could not find a valid audio file name in the query."}
+
+    audio_filename = match.group(1)
+    audio_file_path = os.path.join(config.UNSTRUCTURED_DATA_PATH, audio_filename)
+
+    if not os.path.exists(audio_file_path):
+        return {"error": f"Audio file '{audio_filename}' not found in the configured data path."}
+
+    try:
+        logger.info(f"Transcribing audio file: {audio_file_path}")
+        result = whisper_model.transcribe(audio_file_path)
+        transcription = result["text"]
+
+        state['messages'].append(AIMessage(content=f"Full transcription:\n{transcription}"))
+
+        logger.info("Transcription complete. Generating summary...")
+        prompt = ChatPromptTemplate.from_template(prompts.VOICE_SUMMARY_PROMPT)
+        chain = prompt | llm | StrOutputParser()
+        summary = chain.invoke({"transcription": transcription})
+
+        response_model = VoiceResponse(
+            session_id=state['session_id'],
+            user_query=user_query,
+            summary=summary,
+            transcription=transcription
+        )
+        return {"final_response": response_model}
+
+    except Exception as e:
+        logger.error(f"Error during voice processing: {e}")
+        return {"error": f"Error during voice processing: {e}"}
+
+
+def context_engineer_agent(state: AgentState) -> dict:
+    """
+    Assembles all available context into a clear, structured format.
+    This node runs before the final response generation to ensure the LLM
+    has all the necessary information. This is a placeholder for more complex
+    context manipulation in the future.
+
+    Args:
+        state (AgentState): The current state of the workflow.
+
+    Returns:
+        dict: An empty dictionary as no state change is needed for this version.
+    """
+    logger.info("---CONTEXT ENGINEER AGENT---")
+    return {}
 
 def response_agent(state: AgentState) -> dict:
     """
@@ -278,6 +351,9 @@ def response_agent(state: AgentState) -> dict:
               serialized from a Pydantic model.
     """
     logger.info("---RESPONSE AGENT---")
+    if isinstance(state.get("final_response"), BaseResponse):
+        return {"final_response": state["final_response"].model_dump_json()}
+
     rag_result = state.get("rag_result")
     sql_result = state.get("sql_result")
     session_id = state.get("session_id")
@@ -327,8 +403,7 @@ def response_agent(state: AgentState) -> dict:
 
 def create_optimized_error_log_table(spark: SparkSession):
     """
-    Creates the error log Delta table with an explicit schema and optimized properties
-    if it does not already exist.
+    Creates the error log Delta table with optimized properties if it does not exist.
 
     Args:
         spark (SparkSession): The active Spark session.
@@ -351,8 +426,7 @@ def create_optimized_error_log_table(spark: SparkSession):
 
 def llm_error_agent(state: AgentState) -> dict:
     """
-    Handles errors by logging them to an optimized Delta table and using the LLM
-    to suggest a fix. Formats the output as a Pydantic model.
+    Handles errors by logging them to a Delta table and using the LLM to suggest a fix.
 
     Args:
         state (AgentState): The current state containing the error message.
@@ -391,86 +465,16 @@ def llm_error_agent(state: AgentState) -> dict:
 
 def save_cache_agent(state: AgentState) -> dict:
     """
-    Saves the final response (as a JSON string) to the cache Delta table.
+    Saves the final response to the cache.
 
     Args:
         state (AgentState): The current state containing the final response.
 
     Returns:
-        dict: An empty dictionary as this is a terminal node for this path.
+        dict: An empty dictionary.
     """
     logger.info("---SAVE CACHE AGENT---")
     spark = SparkSession.builder.appName("SaveCacheAgent").getOrCreate()
     response_to_cache = state['final_response'] if isinstance(state['final_response'], str) else state['final_response']
     cache_manager.save_to_cache(spark, state['user_query'], response_to_cache, state['session_id'])
     return {}
-
-# --- Main Workflow ---
-def main():
-    """
-    Main function to assemble the LangGraph workflow, compile it, and run an example query.
-    """
-    logger.info("Starting the multi-agent system...")
-    vsc = VectorSearchClient()
-
-    workflow = StateGraph(AgentState)
-
-    # Bind the vsc client to the agents that require it using functools.partial
-    rag_agent_with_vsc = partial(rag_agent, vsc=vsc)
-    mixed_intent_agent_with_vsc = partial(mixed_intent_agent, vsc=vsc)
-
-    # Add all agent functions as nodes in the graph
-    workflow.add_node("cache_agent", cache_agent)
-    workflow.add_node("router", router_agent)
-    workflow.add_node("intent_agent", intent_agent)
-    workflow.add_node("rag_agent", rag_agent_with_vsc)
-    workflow.add_node("text_to_sql_agent", text_to_sql_agent)
-    workflow.add_node("mixed_intent_agent", mixed_intent_agent_with_vsc)
-    workflow.add_node("response_agent", response_agent)
-    workflow.add_node("llm_error_agent", llm_error_agent)
-    workflow.add_node("save_cache", save_cache_agent)
-
-    # Define the workflow's entry point and edges
-    workflow.set_entry_point("cache_agent")
-
-    # Define conditional routing based on agent outputs
-    workflow.add_conditional_edges("cache_agent", lambda state: "continue" if not state.get("from_cache") else "end", {"continue": "router", "end": END})
-    workflow.add_edge("router", "intent_agent")
-    workflow.add_conditional_edges("intent_agent", lambda state: state["intent"], {"structured": "text_to_sql_agent", "unstructured": "rag_agent", "mixed": "mixed_intent_agent"})
-
-    workflow.add_conditional_edges("rag_agent", lambda state: "error" if state.get("error") else "continue", {"continue": "response_agent", "error": "llm_error_agent"})
-    workflow.add_conditional_edges("text_to_sql_agent", lambda state: "error" if state.get("error") else "continue", {"continue": "response_agent", "error": "llm_error_agent"})
-    workflow.add_conditional_edges("mixed_intent_agent", lambda state: "error" if state.get("error") else "continue", {"continue": "response_agent", "error": "llm_error_agent"})
-
-    # Connect response and error paths to the caching step, then end
-    workflow.add_edge("response_agent", "save_cache")
-    workflow.add_edge("llm_error_agent", "save_cache")
-    workflow.add_edge("save_cache", END)
-
-    # Compile the graph into a runnable application
-    app = workflow.compile()
-
-    logger.info("Multi-agent system is ready.")
-
-    # --- Example Usage ---
-    session_id = str(uuid.uuid4())
-    query = "What are our top selling products?"
-    inputs = {"user_query": query, "session_id": session_id, "messages": []}
-
-    for output in app.stream(inputs, {"recursion_limit": 10}):
-        for key, value in output.items():
-            logger.info(f"--- Node: '{key}' ---")
-            if value and "final_response" in value and value["final_response"]:
-                try:
-                    # Pretty-print the structured JSON output
-                    response_json = json.loads(value['final_response'])
-                    logger.info(f"Final Response:\n{json.dumps(response_json, indent=2)}")
-                except (json.JSONDecodeError, TypeError):
-                    # Fallback for plain string responses (e.g., from cache)
-                    logger.info(f"Final Response:\n{value['final_response']}")
-            else:
-                logger.info(f"State Update: {value}")
-        logger.info("\n" + "="*40 + "\n")
-
-if __name__ == "__main__":
-    main()

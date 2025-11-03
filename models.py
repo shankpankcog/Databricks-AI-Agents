@@ -48,3 +48,11 @@ class ErrorResponse(BaseResponse):
     response_type: str = "error"
     error_message: str
     suggested_fix: Optional[str] = None
+
+class VoiceResponse(BaseResponse):
+    """
+    Pydantic model for a response from the Voice Summarization agent.
+    """
+    response_type: str = "voice"
+    summary: str
+    transcription: str

@@ -9,3 +9,6 @@ langchain-openai
 pypdf
 python-docx
 pydantic
+openai-whisper
+langserve[all]
+uvicorn

@@ -7,8 +7,19 @@ Given the user query, determine the intent. The possible intents are:
 'structured': The user is asking a question that can be answered with a SQL query.
 'unstructured': The user is asking a question that can be answered by searching documents.
 'mixed': The user is asking a question that requires both SQL and document search.
+'voice': The user is asking to transcribe or summarize an audio file.
 
 User query: {user_query}
+"""
+
+VOICE_SUMMARY_PROMPT = """
+You are a helpful assistant. The user has provided the following transcription of an audio file.
+Please provide a concise summary of the text.
+
+Transcription:
+{transcription}
+
+Summary:
 """
 
 RAG_AGENT_PROMPT = """
