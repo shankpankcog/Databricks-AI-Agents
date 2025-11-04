@@ -19,26 +19,24 @@ def get_document_id(file_path: str) -> str:
     Generates a unique and deterministic ID for a document based on its file path.
 
     Args:
-        file_path (str): The absolute or relative path to the document file.
+        file_path: The path to the document file.
 
     Returns:
-        str: A unique MD5 hash of the file path.
+        A unique MD5 hash of the file path.
     """
     return hashlib.md5(file_path.encode()).hexdigest()
 
 def create_optimized_delta_table(spark: SparkSession, table_name: str, schema: StructType):
     """
     Creates an optimized Delta table with a specific schema if it doesn't already exist.
-    The table is configured with properties that are beneficial for Vector Search indexing.
 
     Args:
-        spark (SparkSession): The active Spark session.
-        table_name (str): The full, three-level name of the Delta table to create.
-        schema (StructType): The PySpark schema to use for the table.
+        spark: The active Spark session.
+        table_name: The full name of the Delta table to create.
+        schema: The PySpark schema to use for the table.
     """
     if not spark.catalog.tableExists(table_name):
-        logger.info(f"Table '{table_name}' does not exist. Creating it with optimized properties.")
-        # Construct the CREATE TABLE SQL statement from the schema
+        logger.info(f"Table '{table_name}' does not exist. Creating it.")
         schema_sql = ", ".join([f"{field.name} {field.dataType.simpleString()}" for field in schema.fields])
         spark.sql(f"""
             CREATE TABLE {table_name} ({schema_sql})
@@ -50,17 +48,16 @@ def create_optimized_delta_table(spark: SparkSession, table_name: str, schema: S
             )
         """)
     else:
-        logger.info(f"Table '{table_name}' already exists. Skipping creation.")
+        logger.info(f"Table '{table_name}' already exists.")
 
 def process_documents(spark: SparkSession, folder_path: str, target_table: str):
     """
-    Loads PDF and DOCX documents from a folder, splits them into chunks, and upserts
-    them into a target Delta table using a robust schema and SQL MERGE command.
+    Loads documents from a folder, splits them into chunks, and upserts them into a Delta table.
 
     Args:
-        spark (SparkSession): The active Spark session.
-        folder_path (str): The path to the folder containing the documents.
-        target_table (str): The name of the Delta table to upsert the chunks into.
+        spark: The active Spark session.
+        folder_path: The path to the folder containing the documents.
+        target_table: The name of the Delta table to upsert the chunks into.
     """
     if not os.path.exists(folder_path):
         logger.error(f"The folder path '{folder_path}' does not exist.")
@@ -96,7 +93,6 @@ def process_documents(spark: SparkSession, folder_path: str, target_table: str):
         logger.info("No new documents to process.")
         return
 
-    # Define the explicit schema for the chunks DataFrame
     schema = StructType([
         StructField("chunk_id", StringType(), False),
         StructField("source", StringType(), True),
@@ -105,13 +101,11 @@ def process_documents(spark: SparkSession, folder_path: str, target_table: str):
         StructField("text_content", StringType(), True)
     ])
 
-    # Ensure the target Delta table exists with the correct schema and properties
     create_optimized_delta_table(spark, target_table, schema)
 
     chunks_df = spark.createDataFrame(all_chunks, schema=schema)
     logger.info(f"Generated {chunks_df.count()} chunks from the documents.")
 
-    # Use a SQL MERGE for robust upserting
     chunks_df.createOrReplaceTempView("_new_chunks")
 
     merge_sql = f"""

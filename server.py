@@ -84,7 +84,16 @@ workflow.add_edge("save_cache", END)
 langgraph_app = workflow.compile()
 
 # --- Guarded Application Logic ---
-def guarded_app(inputs):
+def guarded_app(inputs: dict) -> dict:
+    """
+    Wraps the main LangGraph application with input and output guardrails.
+
+    Args:
+        inputs (dict): The input dictionary for the LangGraph app.
+
+    Returns:
+        dict: The final output from the LangGraph app, after being processed by the guardrails.
+    """
     if not guardrails.is_content_safe(llm, inputs['user_query']):
         error_model = ErrorResponse(
             session_id=inputs.get("session_id"),

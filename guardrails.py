@@ -6,19 +6,16 @@ from logger_config import get_logger
 
 logger = get_logger(__name__)
 
-# This is a simplified example of a guardrail.
-# In a production system, you might use a more sophisticated content moderation API.
-
 def is_content_safe(llm, content: str) -> bool:
     """
     Checks if the given content is safe by asking a language model.
 
     Args:
         llm: The language model to use for the check.
-        content (str): The text content to validate.
+        content: The text content to validate.
 
     Returns:
-        bool: True if the content is deemed safe, False otherwise.
+        True if the content is deemed safe, False otherwise.
     """
     logger.info("---GUARDRAIL: CHECKING CONTENT SAFETY---")
 
@@ -40,19 +37,18 @@ def is_content_safe(llm, content: str) -> bool:
         return True
     except Exception as e:
         logger.error(f"Error in guardrail check: {e}")
-        # Default to safe in case of an error to avoid blocking valid content.
         return True
 
 def filter_output(llm, response: str) -> str:
     """
-    A simple output guardrail that filters the response if it's deemed unsafe.
+    Filters the response if it's deemed unsafe.
 
     Args:
         llm: The language model to use for the check.
-        response (str): The final response from the agent system.
+        response: The final response from the agent system.
 
     Returns:
-        str: The original response if it's safe, or a fallback message if it's not.
+        The original response if it's safe, or a fallback message if it's not.
     """
     if not is_content_safe(llm, response):
         return "I'm sorry, I cannot provide a response to that request."

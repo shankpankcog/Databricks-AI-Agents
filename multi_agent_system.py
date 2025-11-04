@@ -1,7 +1,7 @@
 # multi_agent_system.py
 import os
 import datetime
-from typing import TypedDict, Annotated, Sequence, Union
+from typing import TypedDict, Annotated, Sequence, Union, Dict, Any
 import operator
 import hashlib
 import uuid
@@ -39,6 +39,7 @@ class AgentState(TypedDict):
         user_query: The initial query from the user for the current turn.
         session_id: A unique identifier for the entire conversation session.
         intent: The determined intent of the user's query.
+        intent_details: The structured JSON output from the intent agent.
         sql_query: The generated SQL query, if applicable.
         sql_result: The stringified result of the executed SQL query.
         rag_result: The result from the RAG agent.
@@ -51,6 +52,7 @@ class AgentState(TypedDict):
     user_query: str
     session_id: str
     intent: str
+    intent_details: Dict[str, Any]
     sql_query: str
     sql_result: str
     rag_result: str
@@ -122,25 +124,89 @@ def router_agent(state: AgentState) -> dict:
 
 def intent_agent(state: AgentState) -> dict:
     """
-    Determines the user's intent using the LLM.
+    Determines the user's intent and extracts structured details.
 
     Args:
         state: The current state of the workflow.
 
     Returns:
-        A dictionary containing the determined intent.
+        A dictionary containing the structured intent details.
     """
     logger.info("---INTENT AGENT---")
     prompt = ChatPromptTemplate.from_template(prompts.INTENT_AGENT_PROMPT)
     chain = prompt | llm | StrOutputParser()
-    intent = chain.invoke({"user_query": state['user_query']}).strip().lower()
-    logger.info(f"Detected intent: {intent}")
 
-    if "structured" in intent: return {"intent": "structured"}
-    if "unstructured" in intent: return {"intent": "unstructured"}
-    if "mixed" in intent: return {"intent": "mixed"}
-    if "voice" in intent: return {"intent": "voice"}
-    return {"intent": "unstructured"}
+    try:
+        response_json = chain.invoke({"user_query": state['user_query']})
+        intent_details = json.loads(response_json)
+        logger.info(f"Detected Intent Details: {intent_details}")
+        intent = intent_details.get("intent", "Descriptive").lower()
+        return {"intent": intent, "intent_details": intent_details}
+    except (json.JSONDecodeError, KeyError) as e:
+        logger.error(f"Failed to parse intent JSON: {e}. Defaulting to Descriptive.")
+        return {"intent": "descriptive", "intent_details": {"intent": "Descriptive"}}
+
+def get_all_column_names(schema_text: str) -> set:
+    """
+    Extracts all column names from the formatted schema block.
+
+    Args:
+        schema_text: The formatted string of table schemas.
+
+    Returns:
+        A set of all column names found in the schema.
+    """
+    return set(re.findall(r"(\w+)\s*\(\w+\)", schema_text))
+
+def text_to_sql_agent(state: AgentState) -> dict:
+    """
+    Generates and executes a SQL query with anti-hallucination and self-correction.
+
+    Args:
+        state: The current state of the workflow.
+
+    Returns:
+        A dictionary with the SQL query and its result, or an error.
+    """
+    logger.info("---TEXT TO SQL AGENT---")
+    spark = SparkSession.builder.appName("MultiAgentSystem").getOrCreate()
+    schema_context = get_table_schemas(spark, config.UNITY_CATALOG_NAME, config.UNITY_CATALOG_SCHEMA_NAME)
+
+    prompt = ChatPromptTemplate.from_template(prompts.TEXT_TO_SQL_AGENT_PROMPT)
+    chain = prompt | llm | StrOutputParser()
+    sql_query = chain.invoke({
+        "catalog": config.UNITY_CATALOG_NAME,
+        "schema": schema_context,
+        "user_query": state['user_query']
+    }).strip()
+
+    available_columns = get_all_column_names(schema_context)
+    queried_columns = set(re.findall(r"\b(\w+)\b", sql_query))
+
+    for col in queried_columns:
+        if col.upper() not in ["SELECT", "FROM", "WHERE", "GROUP", "BY", "ORDER", "LIMIT", "AS", "ON", "JOIN", "INNER", "LEFT", "RIGHT", "OUTER", "SUM", "AVG", "COUNT", "MIN", "MAX", "DATE_TRUNC", "CAST", "YEAR"] and col not in available_columns:
+            logger.error(f"Anti-hallucination check failed. Column '{col}' not in schema.")
+            return {"error": f"The column '{col}' is not present in the table schema and cannot be used in the query."}
+
+    for attempt in range(2):
+        try:
+            logger.info(f"Executing SQL Query (Attempt {attempt + 1}): {sql_query}")
+            result_df = spark.sql(sql_query)
+            result = result_df.limit(100).toPandas().to_string()
+            return {"sql_query": sql_query, "sql_result": result}
+        except Exception as e:
+            error_message = str(e)
+            logger.warning(f"SQL Query failed: {error_message}")
+
+            correction_prompt = ChatPromptTemplate.from_template(prompts.SQL_CORRECTION_PROMPT)
+            correction_chain = correction_prompt | llm | StrOutputParser()
+            sql_query = correction_chain.invoke({
+                "user_query": state['user_query'],
+                "faulty_sql": sql_query,
+                "error_message": error_message
+            }).strip()
+
+    return {"error": f"Failed to execute SQL query after correction: {error_message}"}
 
 def rag_agent(state: AgentState, vsc: VectorSearchClient) -> dict:
     """
@@ -167,49 +233,6 @@ def rag_agent(state: AgentState, vsc: VectorSearchClient) -> dict:
     except Exception as e:
         logger.error(f"Error in RAG agent: {e}")
         return {"error": f"Error in RAG agent: {e}"}
-
-def text_to_sql_agent(state: AgentState) -> dict:
-    """
-    Generates and executes a SQL query with a self-correction loop.
-
-    Args:
-        state: The current state of the workflow.
-
-    Returns:
-        A dictionary with the SQL query and its result, or an error.
-    """
-    logger.info("---TEXT TO SQL AGENT---")
-    spark = SparkSession.builder.appName("MultiAgentSystem").getOrCreate()
-    schema_context = get_table_schemas(spark, config.UNITY_CATALOG_NAME, config.UNITY_CATALOG_SCHEMA_NAME)
-
-    prompt = ChatPromptTemplate.from_template(prompts.TEXT_TO_SQL_AGENT_PROMPT)
-    chain = prompt | llm | StrOutputParser()
-    sql_query = chain.invoke({
-        "catalog": config.UNITY_CATALOG_NAME,
-        "schema": schema_context,
-        "user_query": state['user_query']
-    }).strip()
-
-    for attempt in range(2):
-        try:
-            logger.info(f"Executing SQL Query (Attempt {attempt + 1}): {sql_query}")
-            result_df = spark.sql(sql_query)
-            result = result_df.limit(100).toPandas().to_string()
-            return {"sql_query": sql_query, "sql_result": result}
-        except Exception as e:
-            error_message = str(e)
-            logger.warning(f"SQL Query failed: {error_message}")
-
-            correction_prompt = ChatPromptTemplate.from_template(prompts.SQL_CORRECTION_PROMPT)
-            correction_chain = correction_prompt | llm | StrOutputParser()
-            sql_query = correction_chain.invoke({
-                "user_query": state['user_query'],
-                "faulty_sql": sql_query,
-                "error_message": error_message
-            }).strip()
-
-    return {"error": f"Failed to execute SQL query after correction: {error_message}"}
-
 
 def mixed_intent_agent(state: AgentState, vsc: VectorSearchClient) -> dict:
     """
@@ -306,7 +329,6 @@ def voice_summarization_agent(state: AgentState) -> dict:
         logger.error(f"Error during voice processing: {e}")
         return {"error": f"Error during voice processing: {e}"}
 
-
 def context_engineer_agent(state: AgentState) -> dict:
     """
     Assembles all available context into a single, structured block of text.
@@ -343,6 +365,9 @@ def response_agent(state: AgentState) -> dict:
         A dictionary containing the final response as a JSON string.
     """
     logger.info("---RESPONSE AGENT (REFACTORED)---")
+    if isinstance(state.get("final_response"), BaseResponse):
+        return {"final_response": state["final_response"].model_dump_json()}
+
     engineered_context = state.get("engineered_context")
     if not engineered_context:
         return llm_error_agent({"error": "Context engineering failed."})

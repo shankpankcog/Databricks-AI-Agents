@@ -14,18 +14,15 @@ def wait_for_endpoint_to_be_ready(vsc: VectorSearchClient, endpoint_name: str):
     """
     Waits for a Databricks Vector Search endpoint to become ONLINE.
 
-    This function polls the endpoint's status and waits until it is fully provisioned.
-    It includes a timeout to prevent indefinite waiting.
-
     Args:
-        vsc (VectorSearchClient): The initialized Vector Search client.
-        endpoint_name (str): The name of the endpoint to check.
+        vsc: The initialized Vector Search client.
+        endpoint_name: The name of the endpoint to check.
 
     Raises:
         Exception: If the endpoint enters a non-recoverable state or times out.
     """
     logger.info(f"Waiting for endpoint '{endpoint_name}' to become ready...")
-    for i in range(180): # Wait for up to 30 minutes (180 * 10 seconds)
+    for i in range(180): # Wait for up to 30 minutes
         endpoint = vsc.get_endpoint(name=endpoint_name)
         status = endpoint.get("endpoint_status", {}).get("state", "UNKNOWN")
         if status == "ONLINE":
@@ -41,16 +38,9 @@ def wait_for_endpoint_to_be_ready(vsc: VectorSearchClient, endpoint_name: str):
 def setup_vector_search_index():
     """
     Sets up a Databricks Vector Search endpoint and a continuous Delta Sync index.
-
-    This function is idempotent. It will:
-    1. Create the Vector Search endpoint if it does not already exist.
-    2. Wait for the endpoint to be online.
-    3. Create the continuous Delta Sync index if it does not already exist.
-       If the index does exist, it will trigger a sync to process any updates.
     """
     vsc = VectorSearchClient()
 
-    # --- Step 1: Create a Vector Search Endpoint ---
     try:
         vsc.get_endpoint(name=config.VECTOR_SEARCH_ENDPOINT_NAME)
         logger.info(f"Endpoint '{config.VECTOR_SEARCH_ENDPOINT_NAME}' already exists.")
@@ -64,16 +54,15 @@ def setup_vector_search_index():
 
     wait_for_endpoint_to_be_ready(vsc, config.VECTOR_SEARCH_ENDPOINT_NAME)
 
-    # --- Step 2: Create or Sync the Vector Search Index ---
     try:
         vsc.create_delta_sync_index(
             endpoint_name=config.VECTOR_SEARCH_ENDPOINT_NAME,
             index_name=config.VECTOR_SEARCH_INDEX_NAME,
             source_table_name=config.DELTA_SYNC_TABLE,
             pipeline_type="CONTINUOUS",
-            primary_key="chunk_id", # This must match the primary key in your source Delta table
-            embedding_source_column="text_content", # The column containing the text to embed
-            embedding_model_endpoint_name="databricks-bge-large-en" # A recommended embedding model
+            primary_key="chunk_id",
+            embedding_source_column="text_content",
+            embedding_model_endpoint_name="databricks-bge-large-en"
         )
         logger.info(f"Successfully created index '{config.VECTOR_SEARCH_INDEX_NAME}'.")
     except Exception as e:
@@ -85,7 +74,5 @@ def setup_vector_search_index():
 
 if __name__ == "__main__":
     logger.info("Setting up Databricks Vector Search Index...")
-    # This script assumes that the source Delta table specified in config.py
-    # has already been created and populated by running the ingest_data.py script.
     setup_vector_search_index()
     logger.info("Setup complete.")
