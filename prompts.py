@@ -58,16 +58,45 @@ Summary:
 """
 
 RAG_AGENT_PROMPT = """
-Answer the following question based on the provided context from documents and table schemas.
+###############################
+# RAG Agent Instructions
+###############################
 
-Context from Documents:
+Your task is to answer the user's question based *only* on the provided context.
+Do not use any prior knowledge.
+
+You have been given two types of context:
+1.  **Unstructured Context**: Excerpts from relevant documents.
+2.  **Structured Context**: The schema of relevant database tables.
+
+Carefully synthesize information from both sources to provide a comprehensive answer.
+
+**Rules:**
+- If the answer is found in the Unstructured Context, cite the key findings from the documents.
+- If the answer requires information about what data is available in the database, refer to the table schemas in the Structured Context.
+- If the user's question cannot be answered using the provided context, you MUST state that you do not have enough information to answer the question. Do not try to guess.
+
+###############################
+# Provided Context
+###############################
+
+**Unstructured Context (from Documents):**
 {document_context}
 
-Context from Table Schemas:
+---
+
+**Structured Context (from Table Schemas):**
 {schema_context}
 
-Question:
+###############################
+# User's Question
+###############################
+
 {question}
+
+###############################
+# Final Answer
+###############################
 """
 
 TEXT_TO_SQL_AGENT_PROMPT = """
