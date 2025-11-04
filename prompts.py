@@ -73,6 +73,17 @@ Database Query Result: {sql_result}
 Provide a comprehensive, synthesized answer:
 """
 
+RESPONSE_AGENT_SIMPLE_PROMPT = """
+Based on the following information, answer the user's original question.
+
+User's Question: {user_query}
+
+Available Information:
+{engineered_context}
+
+Final Answer:
+"""
+
 ERROR_AGENT_PROMPT = """
 An error occurred: {error}. Please suggest a fix.
 """

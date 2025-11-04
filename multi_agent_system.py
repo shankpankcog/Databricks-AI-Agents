@@ -32,21 +32,20 @@ logger = get_logger(__name__)
 # --- Agent State Definition ---
 class AgentState(TypedDict):
     """
-    Represents the state of the agent workflow. This TypedDict is used by LangGraph
-    to manage the flow of data between different nodes in the graph.
+    Represents the state of the agent workflow.
 
     Attributes:
-        messages (Sequence[BaseMessage]): The history of messages in the conversation.
-        user_query (str): The initial query from the user for the current turn.
-        session_id (str): A unique identifier for the entire conversation session.
-        intent (str): The determined intent of the user's query (e.g., 'structured').
-        sql_query (str): The generated SQL query, if applicable.
-        sql_result (str): The stringified result of the executed SQL query.
-        rag_result (str): The result from the RAG agent.
-        error (str): Any error message that occurs during the workflow.
-        final_response (Union[BaseResponse, str]): The final, user-facing response, which
-            can be a Pydantic model (as a JSON string) or a plain string from the cache.
-        from_cache (bool): A flag to indicate if the response was retrieved from the cache.
+        messages: The history of messages in the conversation.
+        user_query: The initial query from the user for the current turn.
+        session_id: A unique identifier for the entire conversation session.
+        intent: The determined intent of the user's query.
+        sql_query: The generated SQL query, if applicable.
+        sql_result: The stringified result of the executed SQL query.
+        rag_result: The result from the RAG agent.
+        error: Any error message that occurs during the workflow.
+        engineered_context: A consolidated block of text with all context.
+        final_response: The final, user-facing response.
+        from_cache: A flag to indicate if the response was from the cache.
     """
     messages: Annotated[Sequence[BaseMessage], operator.add]
     user_query: str
@@ -56,18 +55,13 @@ class AgentState(TypedDict):
     sql_result: str
     rag_result: str
     error: str
+    engineered_context: str
     final_response: Union[BaseResponse, str]
     from_cache: bool
 
-# --- LLM and VSC Initialization ---
-llm = ChatOpenAI(
-    model=config.ENDPOINT_NAME,
-    api_key=config.DATABRICKS_TOKEN,
-    base_url=f"{config.DATABRICKS_HOST}/serving-endpoints"
-)
+# --- LLM, VSC, and Whisper Initialization ---
+llm = ChatOpenAI(model=config.ENDPOINT_NAME, api_key=config.DATABRICKS_TOKEN, base_url=f"{config.DATABRICKS_HOST}/serving-endpoints")
 vsc = VectorSearchClient()
-
-# --- Pre-load Models ---
 logger.info("Pre-loading Whisper model...")
 whisper_model = whisper.load_model("base")
 logger.info("Whisper model loaded.")
@@ -79,12 +73,12 @@ def get_table_schemas(spark: SparkSession, catalog: str, schema: str) -> str:
     Dynamically fetches schema information for all tables in a given Unity Catalog schema.
 
     Args:
-        spark (SparkSession): The active Spark session.
-        catalog (str): The name of the Unity Catalog.
-        schema (str): The name of the schema within the catalog.
+        spark: The active Spark session.
+        catalog: The name of the Unity Catalog.
+        schema: The name of the schema within the catalog.
 
     Returns:
-        str: A formatted string describing the schemas of all tables, or an error message.
+        A formatted string describing the schemas of all tables.
     """
     logger.info(f"Fetching schemas from {catalog}.{schema}")
     try:
@@ -95,17 +89,15 @@ def get_table_schemas(spark: SparkSession, catalog: str, schema: str) -> str:
         logger.error(f"Could not retrieve table schemas: {e}")
         return "Could not retrieve table schemas."
 
-
 def cache_agent(state: AgentState) -> dict:
     """
-    Checks if a response for the user's query exists in the cache Delta table.
-    This is the entry point of the graph.
+    Checks if a response for the user's query exists in the cache.
 
     Args:
-        state (AgentState): The current state of the workflow.
+        state: The current state of the workflow.
 
     Returns:
-        dict: A dictionary with the cached response if found, or a flag indicating a cache miss.
+        A dictionary with the cached response or a cache miss flag.
     """
     logger.info("---CACHE AGENT---")
     spark = SparkSession.builder.appName("CacheAgent").getOrCreate()
@@ -116,13 +108,13 @@ def cache_agent(state: AgentState) -> dict:
 
 def router_agent(state: AgentState) -> dict:
     """
-    Initializes the conversation history for a new query that was not found in the cache.
+    Initializes the conversation history for a new query.
 
     Args:
-        state (AgentState): The current state of the workflow.
+        state: The current state of the workflow.
 
     Returns:
-        dict: A dictionary indicating the next step is to clarify intent.
+        A dictionary indicating the next step.
     """
     logger.info("---ROUTER AGENT---")
     state['messages'] = [HumanMessage(content=state['user_query'])]
@@ -130,13 +122,13 @@ def router_agent(state: AgentState) -> dict:
 
 def intent_agent(state: AgentState) -> dict:
     """
-    Determines the user's intent (structured, unstructured, mixed, or voice) using the LLM.
+    Determines the user's intent using the LLM.
 
     Args:
-        state (AgentState): The current state of the workflow.
+        state: The current state of the workflow.
 
     Returns:
-        dict: A dictionary containing the determined intent.
+        A dictionary containing the determined intent.
     """
     logger.info("---INTENT AGENT---")
     prompt = ChatPromptTemplate.from_template(prompts.INTENT_AGENT_PROMPT)
@@ -148,29 +140,26 @@ def intent_agent(state: AgentState) -> dict:
     if "unstructured" in intent: return {"intent": "unstructured"}
     if "mixed" in intent: return {"intent": "mixed"}
     if "voice" in intent: return {"intent": "voice"}
-    return {"intent": "unstructured"} # Default fallback
+    return {"intent": "unstructured"}
 
 def rag_agent(state: AgentState, vsc: VectorSearchClient) -> dict:
     """
-    Performs a hybrid RAG search by combining context from both unstructured documents
-    (via Vector Search) and structured table schemas from Unity Catalog.
+    Performs a hybrid RAG search.
 
     Args:
-        state (AgentState): The current state of the workflow.
-        vsc (VectorSearchClient): The initialized Databricks Vector Search client.
+        state: The current state of the workflow.
+        vsc: The initialized Databricks Vector Search client.
 
     Returns:
-        dict: A dictionary with the synthesized RAG result, or an error message.
+        A dictionary with the RAG result or an error message.
     """
     logger.info("---RAG AGENT (HYBRID)---")
     try:
         index = DatabricksVectorSearch(vsc.get_index(endpoint_name=config.VECTOR_SEARCH_ENDPOINT_NAME, index_name=config.VECTOR_SEARCH_INDEX_NAME))
         retriever = index.as_retriever()
         document_context = retriever.invoke(state['user_query'])
-
         spark = SparkSession.builder.appName("RAGAgent").getOrCreate()
         schema_context = get_table_schemas(spark, config.UNITY_CATALOG_NAME, config.UNITY_CATALOG_SCHEMA_NAME)
-
         prompt = ChatPromptTemplate.from_template(prompts.RAG_AGENT_PROMPT)
         chain = prompt | llm | StrOutputParser()
         result = chain.invoke({"question": state['user_query'], "document_context": document_context, "schema_context": schema_context})
@@ -181,14 +170,13 @@ def rag_agent(state: AgentState, vsc: VectorSearchClient) -> dict:
 
 def text_to_sql_agent(state: AgentState) -> dict:
     """
-    Generates and executes a SQL query. Includes a self-correction loop to attempt
-    to fix and retry failed queries.
+    Generates and executes a SQL query with a self-correction loop.
 
     Args:
-        state (AgentState): The current state of the workflow.
+        state: The current state of the workflow.
 
     Returns:
-        dict: A dictionary with the SQL query and its result, or an error if it fails after retries.
+        A dictionary with the SQL query and its result, or an error.
     """
     logger.info("---TEXT TO SQL AGENT---")
     spark = SparkSession.builder.appName("MultiAgentSystem").getOrCreate()
@@ -225,16 +213,14 @@ def text_to_sql_agent(state: AgentState) -> dict:
 
 def mixed_intent_agent(state: AgentState, vsc: VectorSearchClient) -> dict:
     """
-    Handles mixed-intent queries by first performing a RAG search to gather context,
-    then using that context to generate a more informed SQL query. Includes a
-    self-correction loop for the SQL execution part.
+    Handles mixed-intent queries with a self-correction loop.
 
     Args:
-        state (AgentState): The current state of the workflow.
-        vsc (VectorSearchClient): The initialized Databricks Vector Search client.
+        state: The current state of the workflow.
+        vsc: The initialized Databricks Vector Search client.
 
     Returns:
-        dict: A dictionary containing both RAG and SQL results, or an error.
+        A dictionary containing both RAG and SQL results, or an error.
     """
     logger.info("---MIXED INTENT AGENT---")
     rag_output = rag_agent(state, vsc)
@@ -275,18 +261,17 @@ def mixed_intent_agent(state: AgentState, vsc: VectorSearchClient) -> dict:
 
 def voice_summarization_agent(state: AgentState) -> dict:
     """
-    Transcribes an audio file using Whisper and generates a summary with an LLM.
+    Transcribes an audio file and generates a summary.
 
     Args:
-        state (AgentState): The current state of the workflow.
+        state: The current state of the workflow.
 
     Returns:
-        dict: A dictionary containing the final response as a Pydantic model.
+        A dictionary containing the final response as a Pydantic model.
     """
     logger.info("---VOICE SUMMARIZATION AGENT---")
     user_query = state['user_query']
 
-    # Use regex to find just the filename, not the full path
     match = re.search(r"[\s\"']?([^\s\"'/]+\.(mp3|wav|m4a|flac))[\s\"']?", user_query)
     if not match:
         return {"error": "Could not find a valid audio file name in the query."}
@@ -324,89 +309,60 @@ def voice_summarization_agent(state: AgentState) -> dict:
 
 def context_engineer_agent(state: AgentState) -> dict:
     """
-    Assembles all available context into a clear, structured format.
-    This node runs before the final response generation to ensure the LLM
-    has all the necessary information. This is a placeholder for more complex
-    context manipulation in the future.
+    Assembles all available context into a single, structured block of text.
 
     Args:
-        state (AgentState): The current state of the workflow.
+        state: The current state of the workflow.
 
     Returns:
-        dict: An empty dictionary as no state change is needed for this version.
+        A dictionary updating the `engineered_context` field in the state.
     """
     logger.info("---CONTEXT ENGINEER AGENT---")
-    return {}
+    context_parts = []
+    if state.get("messages"):
+        history = "\n".join([f"{msg.type}: {msg.content}" for msg in state["messages"]])
+        context_parts.append(f"Conversation History:\n{history}")
+    if state.get("rag_result"):
+        context_parts.append(f"Information from Documents:\n{state['rag_result']}")
+    if state.get("sql_result"):
+        context_parts.append(f"Database Query Results:\n{state['sql_result']}")
+    if not context_parts:
+        return {"error": "No context was generated by the previous steps."}
+    engineered_context = "\n\n---\n\n".join(context_parts)
+    logger.info(f"Engineered Context:\n{engineered_context}")
+    return {"engineered_context": engineered_context}
 
 def response_agent(state: AgentState) -> dict:
     """
-    Formats the final response into a structured Pydantic model. It synthesizes
-    results for mixed-intent queries or formats single-source results.
+    Generates the final response using the engineered context.
 
     Args:
-        state (AgentState): The current state containing results from previous agents.
+        state: The current state of the workflow.
 
     Returns:
-        dict: A dictionary containing the final response as a JSON string
-              serialized from a Pydantic model.
+        A dictionary containing the final response as a JSON string.
     """
-    logger.info("---RESPONSE AGENT---")
-    if isinstance(state.get("final_response"), BaseResponse):
-        return {"final_response": state["final_response"].model_dump_json()}
-
-    rag_result = state.get("rag_result")
-    sql_result = state.get("sql_result")
-    session_id = state.get("session_id")
-    user_query = state.get("user_query")
-
-    if rag_result and sql_result:
-        prompt = ChatPromptTemplate.from_template(prompts.RESPONSE_AGENT_MIXED_PROMPT)
-        chain = prompt | llm | StrOutputParser()
-        answer = chain.invoke({"user_query": user_query, "rag_result": rag_result, "sql_result": sql_result})
-        response_model = MixedResponse(
-            session_id=session_id,
-            user_query=user_query,
-            synthesized_answer=answer,
-            rag_sources=[],
-            sql_query=state.get("sql_query", "")
-        )
-        return {"final_response": response_model.model_dump_json()}
-
-    elif sql_result:
-        prompt = ChatPromptTemplate.from_template(prompts.RESPONSE_AGENT_SQL_PROMPT)
-        chain = prompt | llm | StrOutputParser()
-        summary = chain.invoke({"user_query": user_query, "sql_result": sql_result})
-        response_model = SQLResponse(
-            session_id=session_id,
-            user_query=user_query,
-            summary=summary,
-            sql_query=state.get("sql_query", ""),
-            tabular_result=sql_result
-        )
-        return {"final_response": response_model.model_dump_json()}
-
-    elif rag_result:
-        response_model = RAGResponse(
-            session_id=session_id,
-            user_query=user_query,
-            rag_content=rag_result,
-            sources=[]
-        )
-        return {"final_response": response_model.model_dump_json()}
-
-    error_model = ErrorResponse(
-        session_id=session_id,
-        user_query=user_query,
-        error_message=state.get("error", "An unknown error occurred in the response agent.")
+    logger.info("---RESPONSE AGENT (REFACTORED)---")
+    engineered_context = state.get("engineered_context")
+    if not engineered_context:
+        return llm_error_agent({"error": "Context engineering failed."})
+    prompt = ChatPromptTemplate.from_template(prompts.RESPONSE_AGENT_SIMPLE_PROMPT)
+    chain = prompt | llm | StrOutputParser()
+    final_answer = chain.invoke({"user_query": state['user_query'], "engineered_context": engineered_context})
+    response_model = RAGResponse(
+        session_id=state['session_id'],
+        user_query=state['user_query'],
+        rag_content=final_answer,
+        sources=["Synthesized from multiple sources"]
     )
-    return {"final_response": error_model.model_dump_json()}
+    return {"final_response": response_model.model_dump_json()}
 
 def create_optimized_error_log_table(spark: SparkSession):
     """
-    Creates the error log Delta table with optimized properties if it does not exist.
+    Creates the error log Delta table.
 
     Args:
-        spark (SparkSession): The active Spark session.
+        spark: The active Spark session.
     """
     table_name = config.ERROR_LOG_TABLE
     if not spark.catalog.tableExists(table_name):
@@ -426,13 +382,13 @@ def create_optimized_error_log_table(spark: SparkSession):
 
 def llm_error_agent(state: AgentState) -> dict:
     """
-    Handles errors by logging them to a Delta table and using the LLM to suggest a fix.
+    Handles errors by logging them and suggesting a fix.
 
     Args:
-        state (AgentState): The current state containing the error message.
+        state: The current state containing the error message.
 
     Returns:
-        dict: A dictionary containing the error response as a JSON string from a Pydantic model.
+        A dictionary containing the error response as a JSON string.
     """
     logger.error("---LLM ERROR AGENT---")
     error_message = state.get("error", "An unknown error occurred.")
@@ -468,10 +424,10 @@ def save_cache_agent(state: AgentState) -> dict:
     Saves the final response to the cache.
 
     Args:
-        state (AgentState): The current state containing the final response.
+        state: The current state containing the final response.
 
     Returns:
-        dict: An empty dictionary.
+        An empty dictionary.
     """
     logger.info("---SAVE CACHE AGENT---")
     spark = SparkSession.builder.appName("SaveCacheAgent").getOrCreate()
